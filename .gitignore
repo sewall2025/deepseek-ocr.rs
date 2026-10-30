@@ -1,0 +1,10 @@
+.idea
+*.iml
+target
+.DS_Store
+__pycache__
+.venv
+*.bin
+*.dsq
+baselines
+session

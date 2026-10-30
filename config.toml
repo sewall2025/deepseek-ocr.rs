@@ -1,0 +1,21 @@
+[models]
+active = "deepseek-ocr-2"
+
+[models.entries.deepseek-ocr-2]
+# 留空则自动下载到 ~/Library/Caches/deepseek-ocr/models/deepseek-ocr-2/
+# config = "/path/to/config.json"
+# tokenizer = "/path/to/tokenizer.json"
+# weights = "/path/to/model.safetensors"
+
+[inference]
+device = "metal"     # 等同 --device metal
+template = "plain"
+base_size = 1024
+image_size = 768     # deepseek-ocr-2 的默认值
+crop_mode = true
+max_new_tokens = 8192
+use_cache = true
+
+[server]
+host = "0.0.0.0"
+port = 8100
