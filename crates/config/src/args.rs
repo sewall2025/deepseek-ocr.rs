@@ -100,6 +100,10 @@ pub struct ServerBindArgs {
     /// TCP port for server.
     #[arg(long, help_heading = "Application")]
     pub port: Option<u16>,
+
+    /// Number of identical model instances serving requests concurrently.
+    #[arg(long, help_heading = "Application")]
+    pub workers: Option<usize>,
 }
 
 impl From<&CommonInferenceArgs> for crate::InferenceOverride {
@@ -141,6 +145,7 @@ pub fn build_config_overrides(
         server: ServerOverride {
             host: bind.and_then(|value| value.host.clone()),
             port: bind.and_then(|value| value.port),
+            workers: bind.and_then(|value| value.workers),
         },
     }
 }

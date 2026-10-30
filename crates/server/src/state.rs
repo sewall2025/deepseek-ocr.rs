@@ -1,9 +1,9 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::Instant,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device};
 use tokenizers::Tokenizer;
 use tracing::info;
@@ -19,7 +19,70 @@ use deepseek_ocr_infer_paddleocr::load_model as load_paddle_model;
 
 use crate::error::ApiError;
 
-pub type SharedModel = Arc<Mutex<Box<dyn OcrEngine>>>;
+pub type SharedModel = Arc<ModelPool>;
+
+/// Fixed set of identical model instances; requests borrow an idle one and wait when all are busy.
+pub struct ModelPool {
+    idle: Mutex<Vec<(usize, Box<dyn OcrEngine>)>>,
+    available: Condvar,
+}
+
+impl ModelPool {
+    fn new(models: Vec<Box<dyn OcrEngine>>) -> Self {
+        Self {
+            idle: Mutex::new(models.into_iter().enumerate().collect()),
+            available: Condvar::new(),
+        }
+    }
+
+    /// Blocks until a model is idle. The guard returns it to the pool on drop (including on panic).
+    // ponytail: Condvar wakeups are not FIFO, so waiters may be served out of arrival order;
+    // upgrade to a ticket queue if fairness matters.
+    pub fn acquire(&self) -> Result<PooledModel<'_>, ApiError> {
+        let poisoned = |_| ApiError::Internal("model pool lock poisoned".into());
+        let mut idle = self.idle.lock().map_err(poisoned)?;
+        loop {
+            if let Some((worker, model)) = idle.pop() {
+                return Ok(PooledModel {
+                    pool: self,
+                    worker,
+                    model: Some(model),
+                });
+            }
+            idle = self.available.wait(idle).map_err(poisoned)?;
+        }
+    }
+}
+
+pub struct PooledModel<'a> {
+    pool: &'a ModelPool,
+    pub worker: usize,
+    model: Option<Box<dyn OcrEngine>>,
+}
+
+impl std::ops::Deref for PooledModel<'_> {
+    type Target = dyn OcrEngine;
+
+    fn deref(&self) -> &Self::Target {
+        self.model.as_deref().expect("pooled model present until drop")
+    }
+}
+
+impl Drop for PooledModel<'_> {
+    fn drop(&mut self) {
+        if let Some(model) = self.model.take() {
+            // Recover from poisoning so a panicking request never leaks a worker.
+            let mut idle = self
+                .pool
+                .idle
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            idle.push((self.worker, model));
+            drop(idle);
+            self.pool.available.notify_one();
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ModelListing {
@@ -63,7 +126,11 @@ impl AppState {
             })
             .collect::<Vec<_>>();
 
-        let manager = ModelManager::new(fs, config, device, dtype);
+        let workers = config.server.workers;
+        if workers == 0 {
+            bail!("server.workers must be at least 1");
+        }
+        let manager = ModelManager::new(fs, config, device, dtype, workers);
 
         Ok(Self {
             manager,
@@ -177,15 +244,23 @@ struct ModelManager {
     config: Arc<AppConfig>,
     device: Device,
     dtype: DType,
+    workers: usize,
 }
 
 impl ModelManager {
-    fn new(fs: LocalFileSystem, config: Arc<AppConfig>, device: Device, dtype: DType) -> Self {
+    fn new(
+        fs: LocalFileSystem,
+        config: Arc<AppConfig>,
+        device: Device,
+        dtype: DType,
+        workers: usize,
+    ) -> Self {
         Self {
             fs,
             config,
             device,
             dtype,
+            workers,
         }
     }
 
@@ -207,29 +282,41 @@ impl ModelManager {
         let weights_path = prepared.weights;
         let snapshot_path = prepared.snapshot;
 
-        let load_args = ModelLoadArgs {
-            kind: resources.kind,
-            config_path: Some(&config_path),
-            weights_path: Some(&weights_path),
-            snapshot_path: snapshot_path.as_deref(),
-            device: self.device.clone(),
-            dtype: self.dtype,
-        };
-        let start = Instant::now();
-        let model = match resources.kind {
-            ModelKind::Deepseek => load_deepseek_model(load_args)?,
-            ModelKind::PaddleOcrVl => load_paddle_model(load_args)?,
-            ModelKind::DotsOcr => load_dots_model(load_args)?,
-            ModelKind::GlmOcr => load_glm_model(load_args)?,
-        };
-        info!(
-            "Model `{}` loaded in {:.2?} (kind={:?}, flash-attn: {}, weights={})",
-            model_id,
-            start.elapsed(),
-            model.kind(),
-            model.flash_attention_enabled(),
-            weights_path.display()
-        );
+        let mut models = Vec::with_capacity(self.workers);
+        for worker in 0..self.workers {
+            // Each Metal worker gets its own device (own command queue) so decodes don't serialize.
+            let device = if worker > 0 && self.device.is_metal() {
+                Device::new_metal(0)?
+            } else {
+                self.device.clone()
+            };
+            let load_args = ModelLoadArgs {
+                kind: resources.kind,
+                config_path: Some(&config_path),
+                weights_path: Some(&weights_path),
+                snapshot_path: snapshot_path.as_deref(),
+                device,
+                dtype: self.dtype,
+            };
+            let start = Instant::now();
+            let model = match resources.kind {
+                ModelKind::Deepseek => load_deepseek_model(load_args)?,
+                ModelKind::PaddleOcrVl => load_paddle_model(load_args)?,
+                ModelKind::DotsOcr => load_dots_model(load_args)?,
+                ModelKind::GlmOcr => load_glm_model(load_args)?,
+            };
+            info!(
+                "Model `{}` worker {}/{} loaded in {:.2?} (kind={:?}, flash-attn: {}, weights={})",
+                model_id,
+                worker,
+                self.workers,
+                start.elapsed(),
+                model.kind(),
+                model.flash_attention_enabled(),
+                weights_path.display()
+            );
+            models.push(model);
+        }
         let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path).map_err(|err| {
             anyhow::anyhow!(
                 "failed to load tokenizer from {}: {err}",
@@ -239,7 +326,7 @@ impl ModelManager {
         Ok(LoadedModel {
             id: model_id.to_string(),
             kind: resources.kind,
-            model: Arc::new(Mutex::new(model)),
+            model: Arc::new(ModelPool::new(models)),
             tokenizer,
         })
     }

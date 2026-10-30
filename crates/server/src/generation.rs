@@ -79,9 +79,8 @@ fn generate_blocking(
     params: DecodeParameters,
     stream: Option<StreamContext>,
 ) -> Result<GenerationResult, ApiError> {
-    let guard = model
-        .lock()
-        .map_err(|_| ApiError::Internal("model lock poisoned".into()))?;
+    let guard = model.acquire()?;
+    let worker = guard.worker;
     let tokenizer_ref = tokenizer.as_ref();
     let stream_controller = stream.map(|ctx| StreamController::new(Arc::clone(&tokenizer), ctx));
     let mut callback_box: Option<StreamCallback> = None;
@@ -135,7 +134,8 @@ fn generate_blocking(
         .unwrap_or_default();
 
     info!(
-        "[generate] prompt={:?} decoded_raw=\"{}\" normalized=\"{}\"",
+        "[generate] worker={} prompt={:?} decoded_raw=\"{}\" normalized=\"{}\"",
+        worker,
         prompt,
         decoded
             .replace('\n', "\\n")

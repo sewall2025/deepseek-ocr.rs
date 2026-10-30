@@ -225,6 +225,8 @@ impl Default for InferenceSettings {
 pub struct ServerSettings {
     pub host: String,
     pub port: u16,
+    /// Number of identical model instances serving requests concurrently.
+    pub workers: usize,
 }
 
 impl Default for ServerSettings {
@@ -232,6 +234,7 @@ impl Default for ServerSettings {
         Self {
             host: "0.0.0.0".to_string(),
             port: 8000,
+            workers: 1,
         }
     }
 }
@@ -355,6 +358,9 @@ impl AppConfig {
         }
         if let Some(port) = overrides.server.port {
             self.server.port = port;
+        }
+        if let Some(workers) = overrides.server.workers {
+            self.server.workers = workers;
         }
     }
 
@@ -575,6 +581,7 @@ pub struct ModelDefaults {
 pub struct ServerOverride {
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub workers: Option<usize>,
 }
 
 pub fn save_config(

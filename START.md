@@ -25,6 +25,7 @@ export DEEPSEEK_OCR_CACHE_DIR=/Volumes/Fandata/models/deepseek-ocr
 | `inference.device` | `metal` | 等同 `--device metal` |
 | `inference.precision` | `f16` | 等同 `--dtype f16` |
 | `server.port` | `8100` | 监听端口，host 为 `0.0.0.0` |
+| `server.workers` | `1` | 并发模型实例数，可用 `--workers N` 覆盖；N 个相同模型并发处理请求，全忙时排队，每个约占 7GB 内存 |
 
 优先级：命令行参数 → 模型默认值 → `config.toml` 的 `[inference]`。
 
